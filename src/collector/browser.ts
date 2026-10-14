@@ -41,6 +41,8 @@ export interface BrowserManagerOptions {
 export interface OpenedRoom {
   page: Page;
   cdp: CDPSession;
+  /** 独立 context（每房间 cookie 时创建，关房时需清理） */
+  context?: BrowserContext;
 }
 
 export class BrowserManager {
@@ -120,18 +122,25 @@ export class BrowserManager {
   /**
    * 打开一个直播间页面并建立 CDP 会话
    * 无头模式需要一次点击手势触发播放器初始化，弹幕 wss 才会建立。
+   * opts.cookie：传入时创建独立 BrowserContext 注入该 cookie（多账号多房间互不干扰）；
+   *               不传时用共享 context + 全局 cookieStore。
    */
-  async openRoom(roomUrl: string, opts: { clickTrigger?: boolean } = {}): Promise<OpenedRoom> {
+  async openRoom(roomUrl: string, opts: { clickTrigger?: boolean; cookie?: string } = {}): Promise<OpenedRoom> {
     await this.init();
-    const ctx = this.context!;
-    const page = await ctx.newPage();
-    const cdp = await ctx.newCDPSession(page);
-    await cdp.send('Network.enable');
 
-    // 注入用户设置的 cookie（含登录态），使页面以登录身份加载，webcast wss 随之携带登录 cookie
-    const cookieStr = cookieStore.getCookieStr();
-    if (cookieStr) {
-      const cookies = cookieStr
+    let ctx: BrowserContext;
+    let ownContext = false;
+    if (opts.cookie && opts.cookie.trim()) {
+      // 每房间独立 context + 独立 cookie
+      ctx = await this.browser!.newContext({
+        userAgent: this.opts.userAgent,
+        viewport: { width: 1440, height: 900 },
+        locale: 'zh-CN',
+      });
+      await ctx.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      });
+      const cookies = opts.cookie
         .split(';')
         .map((part) => {
           const i = part.indexOf('=');
@@ -145,7 +154,32 @@ export class BrowserManager {
         })
         .filter((c): c is { name: string; value: string; domain: string; path: string } => c !== null);
       if (cookies.length) await ctx.addCookies(cookies);
+      ownContext = true;
+    } else {
+      // 共享 context + 全局 cookieStore
+      ctx = this.context!;
+      const cookieStr = cookieStore.getCookieStr();
+      if (cookieStr) {
+        const cookies = cookieStr
+          .split(';')
+          .map((part) => {
+            const i = part.indexOf('=');
+            if (i <= 0) return null;
+            return {
+              name: part.slice(0, i).trim(),
+              value: part.slice(i + 1).trim(),
+              domain: '.douyin.com',
+              path: '/',
+            };
+          })
+          .filter((c): c is { name: string; value: string; domain: string; path: string } => c !== null);
+        if (cookies.length) await ctx.addCookies(cookies);
+      }
     }
+
+    const page = await ctx.newPage();
+    const cdp = await ctx.newCDPSession(page);
+    await cdp.send('Network.enable');
 
     await page.goto(roomUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     // 等待页面标题就绪（页面加载完成信号）
@@ -162,14 +196,22 @@ export class BrowserManager {
         /* 点击失败不阻塞 */
       }
     }
-    return { page, cdp };
+    return { page, cdp, context: ownContext ? ctx : undefined };
   }
 
-  async closeRoom(page: Page): Promise<void> {
+  async closeRoom(page: Page, context?: BrowserContext): Promise<void> {
     try {
       await page.close();
     } catch {
       /* 页面已关闭 */
+    }
+    // 独立 context（每房间 cookie）关闭后清理
+    if (context) {
+      try {
+        await context.close();
+      } catch {
+        /* ignore */
+      }
     }
   }
 

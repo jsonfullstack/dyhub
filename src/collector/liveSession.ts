@@ -6,7 +6,7 @@
  * 本模块不关心业务事件协议，只负责"拿到帧并解码"。
  */
 
-import type { Page, CDPSession } from 'playwright-core';
+import type { Page, CDPSession, BrowserContext } from 'playwright-core';
 import { decodeFrame, type RawProtoMessage } from '../proto/douyin.proto.js';
 
 export interface LiveSessionOptions {
@@ -27,16 +27,19 @@ export class LiveSession {
   private page: Page;
   private cdp: CDPSession;
   private opts: LiveSessionOptions;
+  /** 独立 context（每房间 cookie 时创建，关房时需清理） */
+  private ownContext?: BrowserContext;
   private wsCount = 0;
   private frameCount = 0;
   private msgCount = 0;
   private stopped = false;
 
-  constructor(roomId: string, page: Page, cdp: CDPSession, opts: LiveSessionOptions) {
+  constructor(roomId: string, page: Page, cdp: CDPSession, opts: LiveSessionOptions, ownContext?: BrowserContext) {
     this.roomId = roomId;
     this.page = page;
     this.cdp = cdp;
     this.opts = opts;
+    this.ownContext = ownContext;
     this.attach();
   }
 
@@ -104,6 +107,14 @@ export class LiveSession {
       await this.page.close();
     } catch {
       /* ignore */
+    }
+    // 独立 context（每房间 cookie）关闭后清理
+    if (this.ownContext) {
+      try {
+        await this.ownContext.close();
+      } catch {
+        /* ignore */
+      }
     }
   }
 }

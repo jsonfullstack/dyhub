@@ -106,6 +106,8 @@ function acSignature(site: string, nonce: string, ua: string, ts: number): strin
 export interface LightweightSessionOptions {
   onMessage: (msg: RawProtoMessage, meta: { roomId: string }) => void;
   onError?: (err: Error) => void;
+  /** 每房间独立 cookie（含登录态），设置后该会话不走共享 cookie */
+  cookie?: string;
 }
 
 // 模块级共享 cookie 会话：多房间并发只跑一次 cookie 链，避免高频请求触发抖音风控
@@ -195,8 +197,31 @@ export class LightweightSession {
   /** 主播信息（连接时从直播间 HTML 解析，可能为空） */
   meta: RoomMeta | null = null;
 
+  /** 每房间独立 cookie jar（非空时优先于 sharedJar） */
+  private readonly ownJar: Map<string, string> | null;
+
   constructor(roomId: string, private readonly opts: LightweightSessionOptions) {
     this.roomId = roomId;
+    if (opts.cookie && opts.cookie.trim()) {
+      this.ownJar = new Map();
+      for (const part of opts.cookie.split(';')) {
+        const i = part.indexOf('=');
+        if (i > 0) this.ownJar.set(part.slice(0, i).trim(), part.slice(i + 1).trim());
+      }
+      // 补算 __ac_signature（与 ensureSharedCookies 逻辑一致）
+      const nonce = this.ownJar.get('__ac_nonce') || '';
+      if (this.ownJar.get('ttwid') && nonce) {
+        this.ownJar.set('__ac_signature', acSignature('www.douyin.com', nonce, UA, Math.floor(Date.now() / 1000)));
+      }
+    } else {
+      this.ownJar = null;
+    }
+  }
+
+  /** 本会话使用的 cookie 字符串（优先 ownJar，回退 sharedJar） */
+  private cookieStr(): string {
+    if (this.ownJar) return [...this.ownJar].map(([k, v]) => `${k}=${v}`).join('; ');
+    return sharedCookieStr();
   }
 
   stats() {
@@ -249,8 +274,9 @@ export class LightweightSession {
     this.liveResolve?.(false);
   }
 
-  /** 连接前确保共享 cookie 会话就绪 */
+  /** 连接前确保 cookie 就绪（独立 cookie 直接可用，共享 cookie 走 ensureSharedCookies） */
   private async initCookies(): Promise<void> {
+    if (this.ownJar) return; // 每房间独立 cookie，无需共享链
     await ensureSharedCookies();
   }
 
@@ -260,7 +286,7 @@ export class LightweightSession {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const r = await fetch(`https://live.douyin.com/${this.roomId}`, {
-          headers: { 'User-Agent': UA, Cookie: sharedCookieStr(), Referer: `https://live.douyin.com/${this.roomId}` },
+          headers: { 'User-Agent': UA, Cookie: this.cookieStr(), Referer: `https://live.douyin.com/${this.roomId}` },
           signal: AbortSignal.timeout(12_000),
         });
         const html = (await r.text()).replace(/&quot;/g, '"').replace(/&amp;/g, '&');
@@ -333,7 +359,7 @@ export class LightweightSession {
     await new Promise<void>((resolve, reject) => {
       // 发送完整 cookie（含登录态），使 webcast 服务端推送礼物事件
       const ws = new WebSocket(url, {
-        headers: { 'User-Agent': UA, Cookie: sharedCookieStr() },
+        headers: { 'User-Agent': UA, Cookie: this.cookieStr() },
         handshakeTimeout: 15_000,
       });
       this.ws = ws;

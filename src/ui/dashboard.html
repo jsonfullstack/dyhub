@@ -196,6 +196,11 @@
           <input id="roomInput" placeholder="房间号，如 708764876300" />
           <button id="btnConnect">连接</button>
         </div>
+        <details style="margin-top:8px;">
+          <summary style="font-size:11px;color:var(--muted);cursor:pointer;user-select:none;">独立 Cookie（多账号多房间）</summary>
+          <textarea id="roomCookieInput" placeholder="该房间专用登录 cookie，粘贴整行（含 sessionid_ss 等登录态）" style="width:100%;height:48px;padding:6px;border:1px solid var(--border);border-radius:8px;font-size:11px;resize:vertical;outline:none;font-family:'SF Mono',Menlo,monospace;line-height:1.4;margin-top:6px;"></textarea>
+          <div style="font-size:10px;color:var(--muted);margin-top:4px;">设置后该房间用此 cookie 连接，不影响其他房间。留空则用全局 cookie。</div>
+        </details>
       </div>
       <div>
         <div class="panel-title">已连接房间</div>
@@ -590,14 +595,16 @@ curl -X POST http://${base}/api/webhooks \\
             : r.status === 'error'
               ? `<button class="card-btn" data-act="retry" data-rid="${rid}">重连</button>`
               : '';
+        const cookieBadge = r.hasOwnCookie ? `<span class="roompill" title="使用独立 cookie">🍪</span>` : '';
         item.innerHTML = `<div style="min-width:0;flex:1">
-            <div class="r-head">${avatar}<div class="r-info"><div class="r-name">${escapeHtml(nick)}</div>${meta.title ? `<div class="r-title">${escapeHtml(meta.title)}</div>` : ''}</div></div>
+            <div class="r-head">${avatar}<div class="r-info"><div class="r-name">${escapeHtml(nick)} ${cookieBadge}</div>${meta.title ? `<div class="r-title">${escapeHtml(meta.title)}</div>` : ''}</div></div>
             <div class="r-foot"><span class="rid">${rid}</span> · ${r.msgCount.toLocaleString()} 条消息</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;">
             <span class="st ${r.status}">${stText}</span>
             <div style="display:flex;gap:4px;">
               ${actBtn}
+              <button class="card-btn" data-act="cookie" data-rid="${rid}" title="设置独立 cookie">Cookie</button>
               <button class="card-btn danger" data-act="remove" data-rid="${rid}" title="删除房间">删除</button>
             </div>
           </div>`;
@@ -618,6 +625,8 @@ curl -X POST http://${base}/api/webhooks \\
           } else if (act === 'remove') {
             if (!confirm(`确定删除房间 ${rid}？删除后需重新输入房号连接。`)) return;
             fetch(`/api/rooms/${rid}`, { method: 'DELETE' }).then(() => refresh());
+          } else if (act === 'cookie') {
+            roomCookieDialog(rid);
           }
         });
       });
@@ -632,10 +641,14 @@ curl -X POST http://${base}/api/webhooks \\
     btn.disabled = true;
     btn.classList.add('btn-loading');
     btn.innerHTML = '<span class="spinner"></span>连接中…';
+    // 独立 cookie（可选）
+    const roomCookie = $('roomCookieInput')?.value?.trim() || '';
     // 立即弹出进度浮层，与 fetch 并行轮询后端进度（避免等 fetch 返回才弹浮层）
     const progressPromise = connectWithProgress(rid);
     try {
-      const r = await fetch('/api/rooms/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roomId: rid }) });
+      const body = { roomId: rid };
+      if (roomCookie) body.cookie = roomCookie;
+      const r = await fetch('/api/rooms/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const j = await r.json();
       if (!r.ok) {
         $('connOverlay').classList.remove('show');
@@ -643,6 +656,7 @@ curl -X POST http://${base}/api/webhooks \\
         return;
       }
       if (!roomId) $('roomInput').value = '';
+      if (!roomId) $('roomCookieInput').value = '';
       await progressPromise;
     } finally {
       btn.innerHTML = orig;
@@ -650,6 +664,30 @@ curl -X POST http://${base}/api/webhooks \\
       btn.classList.remove('btn-loading');
       refresh();
     }
+  }
+
+  /** 房间独立 cookie 设置弹窗 */
+  async function roomCookieDialog(rid) {
+    let status = { set: false, hasLogin: false, keys: [], expiresAt: null };
+    try { status = await (await fetch(`/api/rooms/${rid}/cookie`)).json(); } catch {}
+    const cur = status.set ? `当前已设置（${status.hasLogin ? '含登录态' : '无登录态'}，键: ${status.keys.join(', ')}）` : '未设置独立 cookie';
+    const v = prompt(`房间 ${rid} 独立 Cookie\n${cur}\n\n粘贴新 cookie（留空清除）:`, '');
+    if (v === null) return; // 用户取消
+    if (v.trim()) {
+      await fetch(`/api/rooms/${rid}/cookie`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cookie: v.trim() }) });
+      // 若房间已连接，提示需重连才生效
+      const info = await (await fetch(`/api/rooms/${rid}`)).json().catch(() => null);
+      if (info?.room && info.room.status !== 'stopped') {
+        if (confirm('Cookie 已更新，需要重连才能生效。是否立即重连？')) {
+          await fetch(`/api/rooms/${rid}/disconnect`, { method: 'POST' });
+          connect(rid);
+          return;
+        }
+      }
+    } else {
+      await fetch(`/api/rooms/${rid}/cookie`, { method: 'DELETE' });
+    }
+    refresh();
   }
 
   /** 连接进度浮层：分步动画 + 轮询后端 progress 状态 */

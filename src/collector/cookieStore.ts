@@ -10,7 +10,7 @@
  * （含 Expires/Max-Age 属性）两种格式解析过期时间。
  */
 
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** 判定登录态的 cookie 键名 */
@@ -22,6 +22,8 @@ const COOKIE_ATTRS = new Set(['expires', 'max-age', 'path', 'domain', 'secure', 
 /** 持久化文件路径（相对 cwd；Docker 中 cwd=/app，挂载 data/ 卷即可持久化） */
 const DATA_DIR = join(process.cwd(), 'data');
 const COOKIE_FILE = join(DATA_DIR, 'cookie.json');
+/** 每房间 cookie 持久化目录 */
+const ROOM_COOKIE_DIR = join(DATA_DIR, 'room-cookies');
 
 let store = new Map<string, string>();
 /** 最早过期时间（ms 时间戳），null 表示未知 */
@@ -30,6 +32,14 @@ let expiresAt: number | null = null;
 let savedAt: number | null = null;
 /** 是否已从文件加载（用于区分"文件 cookie"与"环境变量 cookie"） */
 let persisted = false;
+
+// ---- 每房间独立 cookie 存储 ----
+interface RoomCookieEntry {
+  store: Map<string, string>;
+  expiresAt: number | null;
+  savedAt: number | null;
+}
+const roomStores = new Map<string, RoomCookieEntry>();
 
 /** 从 "k=v; k=v" 或 Set-Cookie 响应头解析 cookie 键值对与过期时间 */
 function parseCookieStr(str: string): { store: Map<string, string>; expiresAt: number | null } {
@@ -187,4 +197,116 @@ export function getStatus(): {
     savedAt,
     persisted,
   };
+}
+
+// ==================== 每房间独立 Cookie ====================
+
+/** 从磁盘加载所有房间的持久化 cookie（启动时调用） */
+function loadRoomCookiesFromDisk(): void {
+  try {
+    if (!existsSync(ROOM_COOKIE_DIR)) return;
+    for (const file of readdirSync(ROOM_COOKIE_DIR)) {
+      if (!file.endsWith('.json')) continue;
+      const roomId = file.slice(0, -5);
+      try {
+        const raw = readFileSync(join(ROOM_COOKIE_DIR, file), 'utf8');
+        const data = JSON.parse(raw) as { cookie?: string; expiresAt?: number | null; savedAt?: number };
+        if (!data.cookie || !data.cookie.trim()) continue;
+        if (data.expiresAt && data.expiresAt < Date.now()) {
+          try { unlinkSync(join(ROOM_COOKIE_DIR, file)); } catch { /* noop */ }
+          continue;
+        }
+        const { store: parsed } = parseCookieStr(data.cookie);
+        if (parsed.size === 0) continue;
+        roomStores.set(roomId, {
+          store: parsed,
+          expiresAt: data.expiresAt ?? null,
+          savedAt: data.savedAt ?? null,
+        });
+      } catch { /* skip bad file */ }
+    }
+    if (roomStores.size) console.log(`[dyhub] 已从 data/room-cookies/ 恢复 ${roomStores.size} 个房间的 cookie`);
+  } catch { /* noop */ }
+}
+
+/** 将某房间 cookie 写入磁盘 */
+function saveRoomCookieToDisk(roomId: string, cookieStr: string, exp: number | null): void {
+  try {
+    mkdirSync(ROOM_COOKIE_DIR, { recursive: true });
+    writeFileSync(join(ROOM_COOKIE_DIR, `${roomId}.json`), JSON.stringify({ cookie: cookieStr, expiresAt: exp, savedAt: Date.now() }, null, 2));
+  } catch (e) {
+    console.warn(`[dyhub] 持久化房间 ${roomId} cookie 失败:`, (e as Error).message);
+  }
+}
+
+/** 删除某房间的磁盘 cookie 文件 */
+function deleteRoomCookieFromDisk(roomId: string): void {
+  try {
+    const f = join(ROOM_COOKIE_DIR, `${roomId}.json`);
+    if (existsSync(f)) unlinkSync(f);
+  } catch { /* noop */ }
+}
+
+// 启动时加载房间 cookie（仅当未通过环境变量设置全局 cookie 时，房间 cookie 仍独立加载）
+loadRoomCookiesFromDisk();
+
+/** 设置某房间的独立 cookie（覆盖） */
+export function setRoomCookie(roomId: string, str: string): void {
+  const { store: parsed, expiresAt: exp } = parseCookieStr(str);
+  roomStores.set(roomId, { store: parsed, expiresAt: exp, savedAt: Date.now() });
+  saveRoomCookieToDisk(roomId, str, exp);
+}
+
+/** 某房间的完整 cookie 字符串（无则返回空串） */
+export function getRoomCookieStr(roomId: string): string {
+  const entry = roomStores.get(roomId);
+  if (!entry) return '';
+  return [...entry.store].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+/** 某房间的 cookie 键值 Map（无则返回空 Map） */
+export function getRoomCookieMap(roomId: string): Map<string, string> {
+  const entry = roomStores.get(roomId);
+  if (!entry) return new Map();
+  return new Map(entry.store);
+}
+
+/** 清除某房间的独立 cookie */
+export function clearRoomCookie(roomId: string): void {
+  roomStores.delete(roomId);
+  deleteRoomCookieFromDisk(roomId);
+}
+
+/** 某房间是否设置了独立 cookie */
+export function hasRoomCookie(roomId: string): boolean {
+  return roomStores.has(roomId);
+}
+
+/** 某房间的独立 cookie 是否包含登录态 */
+export function hasRoomLoginCookie(roomId: string): boolean {
+  const entry = roomStores.get(roomId);
+  if (!entry) return false;
+  return LOGIN_KEYS.some((k) => entry.store.has(k));
+}
+
+/** 某房间 cookie 状态摘要 */
+export function getRoomCookieStatus(roomId: string): {
+  set: boolean;
+  hasLogin: boolean;
+  keys: string[];
+  expiresAt: number | null;
+} {
+  const entry = roomStores.get(roomId);
+  if (!entry) return { set: false, hasLogin: false, keys: [], expiresAt: null };
+  return {
+    set: entry.store.size > 0,
+    hasLogin: LOGIN_KEYS.some((k) => entry.store.has(k)),
+    keys: [...entry.store.keys()],
+    expiresAt: entry.expiresAt,
+  };
+}
+
+/** 列出所有设置了独立 cookie 的房间 ID */
+export function listRoomCookies(): string[] {
+  return [...roomStores.keys()];
 }

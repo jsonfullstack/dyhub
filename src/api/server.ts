@@ -65,13 +65,17 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   app.get('/api/rooms', async () => ({ rooms: deps.collector.getRooms() }));
 
   app.post('/api/rooms/connect', async (req, reply) => {
-    const { roomId: rawRoomId } = (req.body ?? {}) as { roomId?: string };
+    const { roomId: rawRoomId, cookie } = (req.body ?? {}) as { roomId?: string; cookie?: string };
     const roomId = normalizeRoomIdInput(rawRoomId);
     if (!roomId) {
       return reply.code(400).send({ error: 'roomId 必须为纯数字（也可直接粘贴 live.douyin.com 直播间链接）' });
     }
+    // 传入 cookie 时持久化到 cookieStore，后续重连自动复用
+    if (cookie && cookie.trim()) {
+      cookieStore.setRoomCookie(roomId, cookie);
+    }
     try {
-      const info = await deps.collector.connect(roomId);
+      const info = await deps.collector.connect(roomId, { cookie: cookie?.trim() || undefined });
       return { ok: true, room: info };
     } catch (e: any) {
       return reply.code(500).send({ error: `连接失败: ${e?.message ?? e}` });
@@ -95,6 +99,29 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const info = deps.collector.getRoomInfo(roomId);
     if (!info) return reply.code(404).send({ error: '房间未连接' });
     return { room: info };
+  });
+
+  // ---- 每房间独立 Cookie（多账号多房间互不干扰）----
+  app.get('/api/rooms/:roomId/cookie', async (req, reply) => {
+    const roomId = normalizeRoomIdInput((req.params as { roomId: string }).roomId);
+    if (!roomId) return reply.code(400).send({ error: 'roomId 无效' });
+    return cookieStore.getRoomCookieStatus(roomId);
+  });
+
+  app.put('/api/rooms/:roomId/cookie', async (req, reply) => {
+    const roomId = normalizeRoomIdInput((req.params as { roomId: string }).roomId);
+    if (!roomId) return reply.code(400).send({ error: 'roomId 无效' });
+    const { cookie } = (req.body ?? {}) as { cookie?: string };
+    if (!cookie || !cookie.trim()) return reply.code(400).send({ error: 'cookie 不能为空' });
+    cookieStore.setRoomCookie(roomId, cookie);
+    return { ok: true, ...cookieStore.getRoomCookieStatus(roomId) };
+  });
+
+  app.delete('/api/rooms/:roomId/cookie', async (req, reply) => {
+    const roomId = normalizeRoomIdInput((req.params as { roomId: string }).roomId);
+    if (!roomId) return reply.code(400).send({ error: 'roomId 无效' });
+    cookieStore.clearRoomCookie(roomId);
+    return { ok: true };
   });
 
   // ---- Webhook 管理 ----

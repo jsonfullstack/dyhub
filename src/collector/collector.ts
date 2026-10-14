@@ -13,6 +13,7 @@ import { LiveSession } from './liveSession.js';
 import { fetchRoomMeta } from './roomMeta.js';
 import type { RoomMeta } from './roomMeta.js';
 import type { RawProtoMessage } from '../proto/douyin.proto.js';
+import * as cookieStore from './cookieStore.js';
 
 /** 采集会话的统一形状（LiveSession / LightweightSession 都实现） */
 export interface SessionLike {
@@ -37,6 +38,8 @@ export interface RoomInfo {
   meta?: RoomMeta | null;
   /** 连接过程进度（launching → listening → live / error） */
   progress?: { step: string; detail?: string; ts: number };
+  /** 是否使用了独立 cookie（而非全局共享 cookie） */
+  hasOwnCookie?: boolean;
 }
 
 /** 连接进度步骤 */
@@ -46,7 +49,7 @@ export interface CollectorOptions {
   /** 浏览器内核：BrowserManager（DYHUB_COLLECTOR=browser 时必填） */
   browser?: BrowserManager;
   /** 轻量内核：会话工厂（DYHUB_COLLECTOR=lightweight 时必填） */
-  createSession?: (roomId: string) => SessionLike;
+  createSession?: (roomId: string, cookie?: string) => SessionLike;
   /** 采集到原始消息的回调（交给管道标准化） */
   onMessage: (msg: RawProtoMessage, meta: { roomId: string }) => void;
 }
@@ -61,8 +64,10 @@ export class Collector {
   private progress = new Map<string, { step: ConnectStep; detail?: string; ts: number }>();
   /** 进行中的连接 Promise，防止并发重复连接同一房间（多个订阅者同时接入时只开一次采集） */
   private connecting = new Map<string, Promise<RoomInfo>>();
+  /** 每房间是否使用了独立 cookie */
+  private ownCookies = new Map<string, boolean>();
   private readonly browser?: BrowserManager;
-  private readonly createSession?: (roomId: string) => SessionLike;
+  private readonly createSession?: (roomId: string, cookie?: string) => SessionLike;
   private readonly onMessage: CollectorOptions['onMessage'];
 
   constructor(opts: CollectorOptions) {
@@ -72,20 +77,22 @@ export class Collector {
   }
 
   /**
-   * 连接并开始采集一个直播间（若房间处于“已停止”保留态，直接恢复）。
+   * 连接并开始采集一个直播间（若房间处于”已停止”保留态，直接恢复）。
    * 并发调用同一 roomId 只触发一次实际连接，复用进行中的 Promise —— 多个订阅者
    * 同时接入同一房间时不会重复开浏览器页面 / 重复建 wss。
+   * opts.cookie：传入时该房间使用独立 cookie（多账号多房间互不干扰）；
+   *               不传时若 cookieStore 有该房间的独立 cookie 则用它，否则回退全局 cookie。
    */
-  async connect(roomId: string): Promise<RoomInfo> {
+  async connect(roomId: string, opts?: { cookie?: string }): Promise<RoomInfo> {
     if (this.sessions.has(roomId)) return this.getRoomInfo(roomId)!;
     const pending = this.connecting.get(roomId);
     if (pending) return pending;
-    const p = this.doConnect(roomId).finally(() => this.connecting.delete(roomId));
+    const p = this.doConnect(roomId, opts).finally(() => this.connecting.delete(roomId));
     this.connecting.set(roomId, p);
     return p;
   }
 
-  private async doConnect(roomId: string): Promise<RoomInfo> {
+  private async doConnect(roomId: string, opts?: { cookie?: string }): Promise<RoomInfo> {
     if (this.sessions.has(roomId)) {
       return this.getRoomInfo(roomId)!;
     }
@@ -99,9 +106,12 @@ export class Collector {
       this.progress.set(roomId, { step, detail, ts: Date.now() });
 
     setProgress('launching');
+    // 确定本房间使用的 cookie：显式传入 > cookieStore 已有独立 cookie > 全局（undefined）
+    const cookie = opts?.cookie ?? (cookieStore.hasRoomCookie(roomId) ? cookieStore.getRoomCookieStr(roomId) : undefined);
+    this.ownCookies.set(roomId, !!cookie);
     const session = this.createSession
-      ? this.createSession(roomId)
-      : await this.createBrowserSession(roomId);
+      ? this.createSession(roomId, cookie)
+      : await this.createBrowserSession(roomId, cookie);
     this.sessions.set(roomId, session);
     session.start?.();
     setProgress('listening');
@@ -138,16 +148,16 @@ export class Collector {
   }
 
   /** 浏览器内核：打开直播间页面（含 Chrome 冷启动），成功后进入订阅监听阶段 */
-  private async createBrowserSession(roomId: string): Promise<SessionLike> {
+  private async createBrowserSession(roomId: string, cookie?: string): Promise<SessionLike> {
     if (!this.browser) throw new Error('未配置浏览器内核（DYHUB_COLLECTOR=browser 时需要 DYHUB_CHROME）');
     const url = `https://live.douyin.com/${roomId}`;
-    const { page, cdp } = await this.browser.openRoom(url);
+    const { page, cdp, context } = await this.browser.openRoom(url, { cookie });
     const session = new LiveSession(roomId, page, cdp, {
       onMessage: (msg, meta) => this.onMessage(msg, meta),
       onError: (err) => {
         this.errors.set(roomId, err.message);
       },
-    });
+    }, context);
     this.progress.set(roomId, { step: 'launching', detail: '页面已打开，等待弹幕通道', ts: Date.now() });
     return session;
   }
@@ -179,6 +189,7 @@ export class Collector {
     this.errors.delete(roomId);
     this.metas.delete(roomId);
     this.progress.delete(roomId);
+    this.ownCookies.delete(roomId);
   }
 
   /** 全部已连接房间 + 已停止保留的房间 */
@@ -198,6 +209,7 @@ export class Collector {
         error: this.errors.get(roomId),
         meta: this.metas.has(roomId) ? this.metas.get(roomId) : undefined,
         progress: this.progress.get(roomId),
+        hasOwnCookie: this.ownCookies.get(roomId) ?? false,
       };
     }
     const saved = this.saved.get(roomId);
@@ -208,6 +220,7 @@ export class Collector {
         startedAt: saved.stoppedAt,
         stats: { wsCount: 0, frameCount: 0, msgCount: saved.msgCount },
         meta: saved.meta ?? undefined,
+        hasOwnCookie: this.ownCookies.get(roomId) ?? false,
       };
     }
     return null;

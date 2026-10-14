@@ -35,6 +35,7 @@ DyHub 是一个抖音直播弹幕采集与分发中台：**双采集内核自研
 - **统一事件协议**：抖音私有 protobuf → 标准化 `DanmakuEvent`，消费端零感知
 - **三通道分发**：WebSocket（低延迟实时）、SSE（浏览器一行接入）、Webhook（HMAC-SHA256 签名鉴权）
 - **多房间并发**：单浏览器实例多页面，支持同时采集多个直播间，控制台一键切换查看
+- **每房间独立 Cookie**：抖音同一账号同一时间只能在一个直播间，多房间共用登录态会互相竞争导致礼物信息丢失。支持为每个房间设置独立 Cookie（多账号多房间互不干扰），持久化到磁盘，Docker 重新部署自动恢复
 - **房间生命周期管理**：连接过程分步进度展示（浏览器启动 → 订阅监听 → 连接成功），支持停止保留 / 一键恢复 / 彻底删除
 - **可视化控制台**：实时弹幕流（头像 / 事件类型 / 来源房间 / 昵称）、事件筛选、房间管理、对接演示与在线测试
 - **可插拔扩展**：新增平台只需写一个 collector 适配器，复用同一套事件协议与分发层
@@ -236,10 +237,11 @@ curl -X POST http://localhost:8757/api/webhooks \
 | --- | --- | --- |
 | GET | `/` | 控制台（实时监控 + 多房间切换 + 对接演示） |
 | GET | `/api/rooms` | 已连接直播间列表（含主播信息与连接进度） |
-| POST | `/api/rooms/connect` | 连接直播间 `{roomId}` |
+| POST | `/api/rooms/connect` | 连接直播间 `{roomId, cookie?}`（`cookie` 为该房间独立登录态，可选） |
 | POST | `/api/rooms/:roomId/disconnect` | 停止采集（房间保留，可随时恢复） |
 | DELETE | `/api/rooms/:roomId` | 彻底删除房间 |
 | GET | `/api/rooms/:roomId` | 单房间详情 |
+| GET/PUT/DELETE | `/api/rooms/:roomId/cookie` | 每房间独立 Cookie（查看 / 设置 / 清除），多账号多房间互不干扰 |
 | GET | `/api/stats` | 全局统计（WS 客户端数 / 房间 / 事件量） |
 | GET/POST/DELETE | `/api/cookie` | 登录 Cookie 管理（查看状态 / 设置 / 清除），详见 [Cookie 配置指南](docs/cookie-guide.md) |
 | GET | `/api/events?types=chat,gift&roomId=xxx` | SSE 实时事件流 |
@@ -351,6 +353,10 @@ npm install -f @typescript/typescript-darwin-x64   # 或 -arm64，按实际报�
 **Q：礼物事件获取不到？**
 
 抖音 webcast 服务端只向已登录的连接推送礼物事件，游客态只收到弹幕 / 进场 / 点赞等。需在控制台填入含 `sessionid_ss` 的登录 Cookie → 详见 [Cookie 配置指南](docs/cookie-guide.md)。
+
+**Q：多个直播间的礼物事件互相竞争 / 只有一个房间能收到礼物？**
+
+抖音同一账号同一时间只能出现在一个直播间，多房间共用一个登录 Cookie 会互相踢掉登录态。解决方案：为每个房间设置**独立 Cookie**（不同账号），控制台连接时展开「独立 Cookie」输入框填写，或点击房间卡片的「Cookie」按钮设置。API 方式：`PUT /api/rooms/:roomId/cookie`，或连接时传 `cookie` 字段。独立 Cookie 持久化到 `data/room-cookies/`，Docker 重新部署自动恢复。
 
 ---
 

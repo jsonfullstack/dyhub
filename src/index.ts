@@ -37,7 +37,7 @@ async function main() {
   if (kernel === 'lightweight') {
     const { LightweightSession } = await import('./collector/lightweightSession.js');
     collector = new Collector({
-      createSession: (roomId) =>
+      createSession: (roomId, cookie) =>
         new LightweightSession(roomId, {
           onMessage: (msg, meta) => {
             const ev = normalize(msg, meta);
@@ -46,6 +46,7 @@ async function main() {
             bus.publish(ev);
           },
           onError: (err) => console.error(`[dyhub] 房间 ${roomId} 采集错误:`, err.message),
+          cookie,
         }),
       onMessage: () => {},
     });
