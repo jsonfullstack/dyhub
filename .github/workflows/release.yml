@@ -84,3 +84,25 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}  # v0.1.0-rc1 → prerelease
+          body: |
+            ## Docker 镜像
+
+            ```bash
+            docker pull ghcr.io/ymstar/dyhub:${{ steps.meta.outputs.version }}
+            ```
+
+            或使用 docker-compose：
+
+            ```yaml
+            services:
+              dyhub:
+                image: ghcr.io/ymstar/dyhub:${{ steps.meta.outputs.version }}
+                ports:
+                  - "8757:8757"
+                shm_size: "2gb"
+                volumes:
+                  - ./data:/app/data
+                restart: unless-stopped
+            ```
+
+            支持架构：`linux/amd64`、`linux/arm64`
