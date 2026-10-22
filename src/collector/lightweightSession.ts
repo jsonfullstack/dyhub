@@ -17,7 +17,7 @@ import vm from 'vm';
 import protobuf from 'protobufjs';
 import { decodeFrame, decodeAckInfo } from '../proto/douyin.proto.js';
 import type { RawProtoMessage } from '../proto/douyin.proto.js';
-import { parseRoomMeta } from './roomMeta.js';
+import { parseRoomMeta, parseRoomStatus } from './roomMeta.js';
 import type { RoomMeta } from './roomMeta.js';
 import * as cookieStore from './cookieStore.js';
 
@@ -184,7 +184,7 @@ async function ensureSharedCookies(): Promise<void> {
 export class LightweightSession {
   readonly roomId: string;
   readonly startedAt = Date.now();
-  status: 'connecting' | 'live' | 'error' = 'connecting';
+  status: 'connecting' | 'live' | 'closed' | 'error' = 'connecting';
 
   private ws: WebSocket | null = null;
   private hbTimer: ReturnType<typeof setInterval> | null = null;
@@ -194,6 +194,8 @@ export class LightweightSession {
   private liveResolve: ((ok: boolean) => void) | null = null;
   private liveTimeout: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
+  /** 房间是否未开播 */
+  private roomClosed = false;
   /** 主播信息（连接时从直播间 HTML 解析，可能为空） */
   meta: RoomMeta | null = null;
 
@@ -239,7 +241,7 @@ export class LightweightSession {
 
   waitForLive(timeoutMs = 30_000): Promise<boolean> {
     if (this.status === 'live') return Promise.resolve(true);
-    if (this.status === 'error') return Promise.resolve(false);
+    if (this.status === 'error' || this.status === 'closed') return Promise.resolve(false);
     return new Promise((resolve) => {
       this.liveResolve = resolve;
       this.liveTimeout = setTimeout(() => {
@@ -268,7 +270,7 @@ export class LightweightSession {
 
   private fail(err: Error) {
     if (this.stopped) return;
-    this.status = 'error';
+    this.status = this.roomClosed ? 'closed' : 'error';
     this.errorMsg = err.message;
     this.opts.onError?.(err);
     this.liveResolve?.(false);
@@ -293,12 +295,18 @@ export class LightweightSession {
         const m = html.match(/roomId\\?"\s*[:=]\s*\\?"(\d+)\\?"/) || html.match(/"roomId"\s*:\s*"?(\d+)"?/);
         if (m) {
           this.meta = parseRoomMeta(html);
+          const st = parseRoomStatus(html);
+          if (st !== null && st !== 2) {
+            this.roomClosed = true;
+            throw new Error('直播间已结束或未开播');
+          }
           return m[1];
         }
         lastErr = new Error('room_id 解析失败（直播间不存在或未开播）');
       } catch (e) {
         lastErr = e as Error;
       }
+      if (this.roomClosed) break; // 已确认未开播，无需再重试
       if (attempt < 2) await new Promise((res) => setTimeout(res, 2500 * (attempt + 1)));
     }
     throw lastErr ?? new Error('room_id 解析失败');

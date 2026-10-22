@@ -8,6 +8,7 @@
 
 import type { Page, CDPSession, BrowserContext } from 'playwright-core';
 import { decodeFrame, type RawProtoMessage } from '../proto/douyin.proto.js';
+import { parseRoomStatus } from './roomMeta.js';
 
 export interface LiveSessionOptions {
   onMessage: (msg: RawProtoMessage, frame: { roomId: string }) => void;
@@ -87,13 +88,29 @@ export class LiveSession {
     });
   }
 
-  /** 等待 wss 建立（最多 timeoutMs） */
+  /** 等待直播间进入可采集状态：先校验开播状态，再等 wss 建立（最多 timeoutMs） */
   async waitForLive(timeoutMs = 15000): Promise<boolean> {
+    // 1) 先判断房间是否在开播（浏览器内核从页面 HTML 读 roomStore.roomInfo.room.status）
+    const roomStatus = await this.getRoomStatus();
+    if (roomStatus != null && roomStatus !== 2) {
+      await this.stop(); // status='closed' + 关闭页面，避免 wss 帧再把状态翻成 live
+      return false;
+    }
+    // 2) 等待 wss 建立；wss 被关闭时提前退出，不必等满超时
     const deadline = Date.now() + timeoutMs;
-    while (this.status !== 'live' && Date.now() < deadline) {
+    while (this.status === 'connecting' && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 500));
     }
     return this.status === 'live';
+  }
+
+  /** 从页面 HTML 解析开播状态（2=直播中，4=已结束）；取不到返回 null */
+  async getRoomStatus(): Promise<number | null> {
+    try {
+      return parseRoomStatus(await this.page.content());
+    } catch {
+      return null;
+    }
   }
 
   stats() {
