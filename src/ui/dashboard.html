@@ -57,6 +57,7 @@
   .st.connecting { background: #fdf0d5; color: #a8781a; animation: pulse 1.6s ease-in-out infinite; }
   .st.stopped { background: #e8e8ee; color: #6b6b78; }
   .st.closed { background: #f3dada; color: #a33; }
+  .st.error { background: #f3dada; color: #a33; }
   .card-btn { padding: 3px 10px; border: none; border-radius: 6px; font-size: 11px; cursor: pointer; font-weight: 500; background: var(--accent); color: #123; }
   .card-btn:hover { filter: brightness(0.94); }
   .card-btn.danger { background: #f5d0cc; color: #a33; }
@@ -587,10 +588,10 @@ curl -X POST http://${base}/api/webhooks \\
         item.className = 'room-item selectable' + (rid === cur ? ' active' : '');
         item.dataset.room = rid;
         item.onclick = () => { roomSelect.value = rid; switchRoom(rid); };
-        const stText = { live: '直播中', connecting: '连接中', stopped: '已停止', error: '连接失败' }[r.status] || r.status;
+        const stText = { live: '直播中', connecting: '连接中', stopped: '已停止', closed: '已关闭', error: '连接失败' }[r.status] || r.status;
         const actBtn = r.status === 'live' || r.status === 'connecting'
           ? `<button class="card-btn danger" data-act="stop" data-rid="${rid}">停止</button>`
-          : r.status === 'stopped'
+          : r.status === 'stopped' || r.status === 'closed'
             ? `<button class="card-btn" data-act="start" data-rid="${rid}">连接</button>`
             : r.status === 'error'
               ? `<button class="card-btn" data-act="retry" data-rid="${rid}">重连</button>`
@@ -708,6 +709,9 @@ curl -X POST http://${base}/api/webhooks \\
       $('ovTitle').textContent = '正在连接直播间';
       ovErr.style.display = 'none';
       ovBar.className = 'bar indet';
+      ovBar.style.width = '';
+      // 重置顶部图标：否则会残留上一次的 ✓ / ✕
+      ovIco.innerHTML = '<div class="spinner-lg"></div>';
       setStep(0, 'active');
       ov.classList.add('show');
 

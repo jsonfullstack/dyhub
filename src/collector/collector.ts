@@ -24,6 +24,8 @@ export interface SessionLike {
   start?(): void;
   stop(): Promise<void>;
   waitForLive(timeoutMs?: number): Promise<boolean>;
+  /** 从页面 HTML 解析开播状态（仅浏览器内核实现；轻量内核在 resolveRoomId 内自行解析） */
+  getRoomStatus?(): Promise<number | null>;
   /** 会话自带的直播间主播信息（轻量内核连接时解析；无则走 fetchRoomMeta 兜底） */
   meta?: RoomMeta | null;
 }
@@ -84,7 +86,11 @@ export class Collector {
    *               不传时若 cookieStore 有该房间的独立 cookie 则用它，否则回退全局 cookie。
    */
   async connect(roomId: string, opts?: { cookie?: string }): Promise<RoomInfo> {
-    if (this.sessions.has(roomId)) return this.getRoomInfo(roomId)!;
+    const existing = this.sessions.get(roomId);
+    // closed / error 视为「旧会话，需要重建」，只对 connecting / live 保持快速返回
+    if (existing && existing.status !== 'closed' && existing.status !== 'error') {
+      return this.getRoomInfo(roomId)!;
+    }
     const pending = this.connecting.get(roomId);
     if (pending) return pending;
     const p = this.doConnect(roomId, opts).finally(() => this.connecting.delete(roomId));
@@ -93,8 +99,17 @@ export class Collector {
   }
 
   private async doConnect(roomId: string, opts?: { cookie?: string }): Promise<RoomInfo> {
-    if (this.sessions.has(roomId)) {
-      return this.getRoomInfo(roomId)!;
+    const stale = this.sessions.get(roomId);
+    if (stale) {
+      // closed / error 视为「旧会话，需要重建」，只对 connecting / live 保持快速返回
+      if (stale.status !== 'closed' && stale.status !== 'error') {
+        return this.getRoomInfo(roomId)!;
+      }
+      // 上一次连接已关闭/失败：清理旧会话与状态，允许重新连接
+      this.sessions.delete(roomId);
+      await stale.stop();
+      this.errors.delete(roomId);
+      this.progress.delete(roomId);
     }
     // 恢复保留的房间：沿用其主播信息，停止保留态
     if (this.saved.has(roomId)) {
@@ -136,9 +151,19 @@ export class Collector {
     session.waitForLive(30_000).then((ok) => {
       if (!this.sessions.has(roomId)) return;
       if (!ok && session.status !== 'live') {
-        const msg = 'wss 连接未在超时内建立（直播间可能未开播或已被风控）';
+        const msg = (() => {
+          if (session.status === 'closed') {
+            return this.errors.get(roomId) || '直播间已结束或未开播';
+          }
+          if (session.status === 'error') {
+            return this.errors.get(roomId) || '连接失败';
+          }
+          return 'wss 连接未在超时内建立（直播间可能未开播或已被风控）';
+        })();
         this.errors.set(roomId, msg);
         setProgress('error', msg);
+        // 未开播时也补全主播信息，避免显示「未知主播」
+        ensureMeta(0);
         return;
       }
       setProgress('live');

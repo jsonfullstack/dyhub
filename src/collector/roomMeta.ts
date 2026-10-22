@@ -31,6 +31,20 @@ export function parseRoomMeta(html: string): RoomMeta | null {
   return { nickname, avatar, title };
 }
 
+/**
+ * 从直播间 HTML 解析开播状态（roomStore.roomInfo.room.status）：
+ * 2=直播中，4=已结束；取不到返回 null。
+ * 该字段在初始 HTML 的 self.__pace_f 序列化数据里，以 \"status\":N 反斜杠转义形式存在，
+ * 因此需要先还原 \" 与 &quot; 两种转义再匹配。
+ */
+export function parseRoomStatus(html: string): number | null {
+  const clean = html.replace(/\\"/g, '"').replace(/&quot;/g, '"');
+  const m =
+    clean.match(/"roomStore":\{"roomInfo":\{"room":\{"id_str":"[^"]*","status":(\d+)/) ||
+    clean.match(/"room":\{"id_str":"[^"]*","status":(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
 // 无 cookie 访问 live.douyin.com 会被 503 风控，会话级缓存 cookie 链（带 TTL）
 let jar: Map<string, string> | null = null;
 let jarAt = 0;
